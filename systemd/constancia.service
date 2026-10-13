@@ -1,0 +1,6 @@
+[Unit]
+Description=constancia: registra hoje como dia de uso (se a tela não estiver bloqueada)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/constancia marcar

@@ -1,0 +1,1491 @@
+#!/usr/bin/env python3
+"""constancia — painel com clima, tarefas e gráfico de atividade.
+
+Cada dia em que você usa o computador vale 1 ponto e cada tarefa concluída
+vale mais 1. Os pontos viram um gráfico no estilo "contribution graph".
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import Counter
+from datetime import date, datetime, timedelta
+
+VERSAO = "0.5.0"
+APP_ID = "io.github.hendesson.constancia"
+
+
+def _xdg(var, padrao):
+    return os.path.join(os.environ.get(var) or os.path.expanduser(padrao), "constancia")
+
+
+DIR = _xdg("XDG_DATA_HOME", "~/.local/share")
+_CONFIG_DIR = _xdg("XDG_CONFIG_HOME", "~/.config")
+_CACHE_DIR = _xdg("XDG_CACHE_HOME", "~/.cache")
+
+# Dados (texto simples; são estes os arquivos sincronizados entre computadores)
+TAREFAS = os.path.join(DIR, "tarefas.tsv")        # id<TAB>texto<TAB>alarme (AAAA-MM-DD HH:MM ou vazio)
+USO = os.path.join(DIR, "uso.txt")                # um dia de uso por linha (AAAA-MM-DD)
+CONCLUIDAS = os.path.join(DIR, "concluidas.tsv")  # dia<TAB>texto<TAB>id<TAB>momento
+REMOVIDAS = os.path.join(DIR, "removidas.txt")    # ids de tarefas que saíram da lista
+LIMPEZA = os.path.join(DIR, "limpeza.txt")        # momento da última exclusão do histórico
+DESENHO = os.path.join(DIR, "desenho.txt")        # "# momento" e depois um dia marcado por linha
+ARQUIVOS_SYNC = ["tarefas.tsv", "uso.txt", "concluidas.tsv", "removidas.txt", "limpeza.txt", "desenho.txt"]
+TAREFAS_ANTIGO = os.path.join(DIR, "tarefas.txt")  # formato das versões 0.1 a 0.3
+
+CIDADE = os.path.join(_CONFIG_DIR, "cidade")
+CONFIG = os.path.join(_CONFIG_DIR, "config.json")
+CLIMA = os.path.join(_CACHE_DIR, "clima.json")
+ESTADO = os.path.join(_CACHE_DIR, "estado.json")
+SYNC = os.path.join(_CACHE_DIR, "sync")           # clone do repositório de sincronização
+CLIMA_TTL = 1800
+
+COR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+NIVEIS = ["\033[38;5;238m", "\033[38;5;22m", "\033[38;5;28m", "\033[38;5;34m", "\033[38;5;46m"]
+MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+DIAS_SEMANA = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+
+AJUDA = """Uso: constancia [comando]
+
+  painel               abre o painel (janela) com clima, tarefas e gráfico
+  (sem comando)        mostra as tarefas e o gráfico no terminal
+  add TEXTO            adiciona uma tarefa
+  ok N [N...]          conclui tarefas (contam no gráfico)
+  rm N [N...]          remove tarefas sem contar
+  alarme N HORA        põe um alarme na tarefa N ("14:30", "25/12 09:00" ou "nenhum")
+  tarefas              mostra só as tarefas
+  grafico              mostra só o gráfico
+  resumo [PERÍODO]     resumo de: dia, semana, mes, ano ou tudo
+  compartilhar [ARQ]   salva uma imagem do gráfico para compartilhar
+                       (com --grafico, só o gráfico, sem o resumo)
+  sync                 sincroniza com o repositório configurado
+  clima                mostra o clima
+  cidade NOME          fixa a cidade do clima ("cidade auto" volta a detectar)
+  marcar               registra hoje como dia de uso, se a tela não estiver
+                       bloqueada (é o que o timer do systemd chama)
+  ajuda                mostra esta ajuda"""
+
+
+def cor(codigo, texto):
+    return f"{codigo}{texto}\033[0m" if COR else str(texto)
+
+
+def titulo(t): return cor("\033[1;31m", t)
+def destaque(t): return cor("\033[36m", t)
+def fraco(t): return cor("\033[90m", t)
+
+
+def ler(arq):
+    if not os.path.exists(arq):
+        return []
+    with open(arq, encoding="utf-8") as f:
+        return [l for l in f.read().splitlines() if l.strip()]
+
+
+def gravar(arq, linhas):
+    """Grava as linhas; não toca no arquivo se o conteúdo já for esse."""
+    linhas = list(linhas)
+    if os.path.exists(arq) and ler(arq) == linhas:
+        return
+    os.makedirs(os.path.dirname(arq), exist_ok=True)
+    with open(arq, "w", encoding="utf-8") as f:
+        f.writelines(l + "\n" for l in linhas)
+
+
+def acrescentar(arq, linha):
+    os.makedirs(os.path.dirname(arq), exist_ok=True)
+    with open(arq, "a", encoding="utf-8") as f:
+        f.write(linha + "\n")
+
+
+def ler_json(arq):
+    try:
+        with open(arq, encoding="utf-8") as f:
+            dados = json.load(f)
+        return dados if isinstance(dados, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def gravar_json(arq, dados):
+    os.makedirs(os.path.dirname(arq), exist_ok=True)
+    with open(arq, "w", encoding="utf-8") as f:
+        json.dump(dados, f, indent=2, ensure_ascii=False)
+
+
+def plural(n, um, varios):
+    return um if n == 1 else varios
+
+
+def agora_iso():
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# ---------- dias de uso ----------
+
+def marcar_hoje():
+    hoje = date.today().isoformat()
+    if hoje not in ler(USO):
+        acrescentar(USO, hoje)
+
+
+def tela_bloqueada():
+    """Pergunta ao systemd-logind se a sessão gráfica está bloqueada."""
+    try:
+        def loginctl(*args):
+            return subprocess.run(["loginctl", *args], capture_output=True, text=True, timeout=5).stdout.strip()
+        sessao = loginctl("show-user", str(os.getuid()), "-p", "Display", "--value")
+        return bool(sessao) and loginctl("show-session", sessao, "-p", "LockedHint", "--value") == "yes"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ---------- tarefas ----------
+
+def novo_id(ordem=0):
+    """Identificador que, ordenado, segue a ordem de criação (igual em todos os computadores)."""
+    return f"{int(time.time() * 1000) + ordem:011x}{os.urandom(2).hex()}"
+
+
+def ler_tarefas():
+    """Tarefas pendentes: [{"id", "texto", "alarme"}]."""
+    if os.path.exists(TAREFAS_ANTIGO) and not os.path.exists(TAREFAS):
+        gravar(TAREFAS, [f"{novo_id(i)}\t{t}\t" for i, t in enumerate(ler(TAREFAS_ANTIGO))])
+        os.remove(TAREFAS_ANTIGO)
+    tarefas = []
+    for l in ler(TAREFAS):
+        c = l.split("\t") + ["", ""]
+        tarefas.append({"id": c[0], "texto": c[1], "alarme": c[2]})
+    return tarefas
+
+
+def gravar_tarefas(tarefas):
+    gravar(TAREFAS, [f"{t['id']}\t{t['texto']}\t{t['alarme']}" for t in tarefas])
+
+
+def adicionar(texto, alarme=""):
+    tarefas = ler_tarefas()
+    tarefas.append({"id": novo_id(), "texto": " ".join(texto.split()), "alarme": alarme})
+    gravar_tarefas(tarefas)
+
+
+def retirar(nums, concluir):
+    """Tira as tarefas de números `nums` da lista; se `concluir`, contam no gráfico."""
+    tarefas = ler_tarefas()
+    retiradas = []
+    for n in sorted(set(nums), reverse=True):
+        t = tarefas.pop(n - 1)
+        if concluir:
+            acrescentar(CONCLUIDAS, f"{date.today().isoformat()}\t{t['texto']}\t{t['id']}\t{agora_iso()}")
+        acrescentar(REMOVIDAS, t["id"])
+        retiradas.append(t["texto"])
+    gravar_tarefas(tarefas)
+    return retiradas
+
+
+def interpretar_alarme(texto):
+    """"14:30" (hoje, ou amanhã se já passou) ou "25/12 09:00" -> "AAAA-MM-DD HH:MM"."""
+    m = re.fullmatch(r"(?:(\d{1,2})/(\d{1,2})\s+)?(\d{1,2})[:h](\d{2})", texto.strip())
+    if not m:
+        raise ValueError("use HH:MM ou DD/MM HH:MM")
+    dia, mes, hora, minuto = (int(x) if x else None for x in m.groups())
+    agora = datetime.now()
+    if dia is None:
+        quando = agora.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+        if quando <= agora:
+            quando += timedelta(days=1)
+    else:
+        quando = datetime(agora.year, mes, dia, hora, minuto)
+        if quando <= agora:
+            quando = quando.replace(year=agora.year + 1)
+    return quando.strftime("%Y-%m-%d %H:%M")
+
+
+def formatar_alarme(alarme):
+    if not alarme:
+        return ""
+    dia, hora = alarme.split(" ")
+    return hora if dia == date.today().isoformat() else f"{dia[8:10]}/{dia[5:7]} {hora}"
+
+
+def definir_alarme(id_tarefa, alarme):
+    tarefas = ler_tarefas()
+    for t in tarefas:
+        if t["id"] == id_tarefa:
+            t["alarme"] = alarme
+    gravar_tarefas(tarefas)
+
+
+def alarmes_vencidos():
+    """Devolve as tarefas cujo alarme já chegou e desarma esses alarmes."""
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M")
+    tarefas = ler_tarefas()
+    vencidas = [t for t in tarefas if t["alarme"] and t["alarme"] <= agora]
+    if vencidas:
+        for t in vencidas:
+            t["alarme"] = ""
+        gravar_tarefas(tarefas)
+    return vencidas
+
+
+def mostrar_tarefas():
+    tarefas = ler_tarefas()
+    if not tarefas:
+        print(f"{titulo('Tarefas')}  {fraco('nenhuma pendente — adicione com')} {destaque('constancia add ...')}")
+        return
+    print(f"{titulo('Tarefas')}  {fraco('(constancia add ... / constancia ok N)')}")
+    for i, t in enumerate(tarefas, 1):
+        alarme = fraco(f"  (alarme {formatar_alarme(t['alarme'])})") if t["alarme"] else ""
+        print(f"{destaque(f'{i:3}')} {t['texto']}{alarme}")
+
+
+def numeros(args):
+    total = len(ler_tarefas())
+    try:
+        nums = [int(a) for a in args]
+    except ValueError:
+        nums = []
+    if not nums or min(nums) < 1 or max(nums) > total:
+        sys.exit("Informe o número da tarefa (veja a lista com: constancia tarefas)")
+    return nums
+
+
+# ---------- desenho e exclusão do histórico ----------
+
+def ler_desenho():
+    """Dias marcados para formar um desenho no gráfico."""
+    return {l for l in ler(DESENHO) if not l.startswith("#")}
+
+
+def gravar_desenho(dias):
+    gravar(DESENHO, [f"# {agora_iso()}"] + sorted(dias))
+
+
+def excluir_historico():
+    """Apaga dias de uso e tarefas concluídas (as pendentes ficam)."""
+    gravar(LIMPEZA, [agora_iso()])
+    gravar(CONCLUIDAS, [])
+    gravar(USO, [date.today().isoformat()])
+
+
+# ---------- pontuação e gráfico ----------
+
+def nivel(pontos):
+    return 0 if pontos <= 0 else 1 if pontos == 1 else 2 if pontos == 2 else 3 if pontos <= 4 else 4
+
+
+def inicio_do_periodo(periodo, hoje):
+    """Primeiro dia de: dia, semana (começa no domingo), mes, ano; None para tudo."""
+    if periodo == "dia":
+        return hoje
+    if periodo == "semana":
+        return hoje - timedelta(days=(hoje.weekday() + 1) % 7)
+    if periodo == "mes":
+        return hoje.replace(day=1)
+    if periodo == "ano":
+        return hoje.replace(month=1, day=1)
+    return None
+
+
+class Atividade:
+    def __init__(self):
+        self.hoje = date.today()
+        self.uso = set(ler(USO))
+        self.desenho = ler_desenho()
+        self.historico = {}  # dia -> [tarefas concluídas]
+        for l in ler(CONCLUIDAS):
+            c = l.split("\t") + [""]
+            self.historico.setdefault(c[0], []).append(c[1])
+        self.feitas = Counter({d: len(t) for d, t in self.historico.items()})
+        self.total_feitas = sum(self.feitas.values())
+        self.seguidos, d = 0, self.hoje
+        while self.pontos(d):
+            self.seguidos += 1
+            d -= timedelta(days=1)
+        self.recorde = self.maior_sequencia(self.dias_ativos())
+
+    @staticmethod
+    def maior_sequencia(dias):
+        maior, atual, anterior = 0, 0, None
+        for d in dias:
+            atual = atual + 1 if anterior and d - anterior == timedelta(days=1) else 1
+            maior, anterior = max(maior, atual), d
+        return maior
+
+    def pontos(self, d):
+        return (d.isoformat() in self.uso) + self.feitas[d.isoformat()]
+
+    def dias_ativos(self, inicio=None):
+        """Dias com uso ou tarefa concluída, em ordem crescente (a partir de `inicio`)."""
+        dias = set()
+        for d in self.uso | set(self.historico):
+            try:
+                dias.add(date.fromisoformat(d))
+            except ValueError:
+                pass
+        return sorted(d for d in dias if inicio is None or d >= inicio)
+
+    def resumo(self, periodo):
+        """Números de um período: dia, semana, mes, ano ou tudo."""
+        inicio = inicio_do_periodo(periodo, self.hoje)
+        ativos = self.dias_ativos(inicio)
+        feitas = {d: self.feitas[d.isoformat()] for d in ativos if self.feitas[d.isoformat()]}
+        melhor = max(feitas, key=feitas.get) if feitas else None
+        return {
+            "dias": ativos,
+            "dias_de_uso": sum(1 for d in ativos if d.isoformat() in self.uso),
+            "tarefas": sum(feitas.values()),
+            "dias_com_tarefa": len(feitas),
+            "sequencia": self.maior_sequencia(ativos),
+            "melhor_dia": melhor,
+            "melhor_dia_tarefas": feitas.get(melhor, 0),
+        }
+
+    def semanas(self, n, inicio=None):
+        """n semanas (domingo a sábado); por padrão as últimas, terminando na semana de hoje."""
+        if inicio is None:
+            inicio = self.hoje - timedelta(days=(self.hoje.weekday() + 1) % 7 + 7 * (n - 1))
+        return [[inicio + timedelta(days=7 * s + r) for r in range(7)] for s in range(n)]
+
+    def por_semana(self, n):
+        """[(primeiro dia da semana, tarefas concluídas)] das últimas n semanas."""
+        return [(s[0], sum(self.feitas[d.isoformat()] for d in s)) for s in self.semanas(n)]
+
+    def descrever(self, d):
+        partes = []
+        if d.isoformat() in self.uso:
+            partes.append("usou o computador")
+        f = self.feitas[d.isoformat()]
+        if f:
+            partes.append(f"{f} {plural(f, 'tarefa concluída', 'tarefas concluídas')}")
+        if d.isoformat() in self.desenho:
+            partes.append("faz parte do desenho")
+        return f"{d.day} de {MESES[d.month - 1]}: " + (", ".join(partes) or "sem atividade")
+
+
+def data_longa(d):
+    return f"{d.day} de {MESES[d.month - 1]} de {d.year} · {DIAS_SEMANA[d.weekday()]}"
+
+
+def rotulos_meses(semanas):
+    """[(índice da semana, nome do mês)] sem sobrepor rótulos vizinhos."""
+    rotulos, livre, anterior = [], 0, None
+    for i, s in enumerate(semanas):
+        if s[0].month != anterior and i >= livre and i + 2 <= len(semanas):
+            rotulos.append((i, MESES[s[0].month - 1]))
+            livre = i + 2
+        anterior = s[0].month
+    return rotulos
+
+
+def linha_resumo(a):
+    return (f"{len(a.uso)} {plural(len(a.uso), 'dia de uso', 'dias de uso')} · "
+            f"{a.total_feitas} {plural(a.total_feitas, 'tarefa concluída', 'tarefas concluídas')} · "
+            f"{a.seguidos} {plural(a.seguidos, 'dia seguido', 'dias seguidos')}")
+
+
+def mostrar_grafico():
+    a = Atividade()
+    n = max(4, min(53, (shutil.get_terminal_size().columns - 5) // 2))
+    semanas = a.semanas(n)
+    meses, pos = "", 0
+    for i, nome in rotulos_meses(semanas):
+        meses += " " * (i * 2 - pos) + nome
+        pos = i * 2 + 3
+    print(f"{titulo('Atividade')}  "
+          f"{destaque(len(a.uso))} {fraco(plural(len(a.uso), 'dia de uso', 'dias de uso'))}  "
+          f"{destaque(a.total_feitas)} {fraco(plural(a.total_feitas, 'tarefa concluída', 'tarefas concluídas'))}  "
+          f"{destaque(a.seguidos)} {fraco(plural(a.seguidos, 'dia seguido', 'dias seguidos'))}")
+    print("    " + fraco(meses))
+    for r, nome in enumerate(["   ", "seg", "   ", "qua", "   ", "sex", "   "]):
+        celulas = "".join(cor(NIVEIS[nivel(a.pontos(s[r]))], "■") + " " if s[r] <= a.hoje else "  " for s in semanas)
+        print(f"{fraco(nome)} {celulas}".rstrip())
+    print("    " + fraco("menos ") + "".join(cor(c, "■") + " " for c in NIVEIS) + fraco("mais"))
+
+
+PERIODOS = {"dia": "Hoje", "semana": "Esta semana", "mes": "Este mês", "ano": "Este ano", "tudo": "Desde o início"}
+
+
+def linhas_do_resumo(a, periodo):
+    """[(valor, legenda)] do resumo de um período."""
+    r = a.resumo(periodo)
+    linhas = [
+        (r["dias_de_uso"], plural(r["dias_de_uso"], "dia de uso", "dias de uso")),
+        (r["tarefas"], plural(r["tarefas"], "tarefa concluída", "tarefas concluídas")),
+        (r["dias_com_tarefa"], plural(r["dias_com_tarefa"], "dia com tarefa concluída", "dias com tarefa concluída")),
+        (r["sequencia"], "maior sequência de dias seguidos"),
+    ]
+    if r["melhor_dia"]:
+        d = r["melhor_dia"]
+        linhas.append((f"{d.day}/{d.month:02}", f"melhor dia ({r['melhor_dia_tarefas']} "
+                       f"{plural(r['melhor_dia_tarefas'], 'tarefa', 'tarefas')})"))
+    return linhas
+
+
+def mostrar_resumo(periodo):
+    if periodo not in PERIODOS:
+        sys.exit("Uso: constancia resumo [dia|semana|mes|ano|tudo]")
+    a = Atividade()
+    print(titulo(PERIODOS[periodo]))
+    for valor, legenda in linhas_do_resumo(a, periodo):
+        print(f"  {destaque(f'{valor:>5}')} {legenda}")
+    for d in a.resumo(periodo)["dias"][::-1]:
+        for t in a.historico.get(d.isoformat(), []):
+            print(f"  {fraco(f'{d.day:02}/{d.month:02}')} ✔ {t}")
+
+
+# ---------- sincronização (repositório git, ex.: GitHub privado) ----------
+
+def mesclar(a, b):
+    """Une os dados das pastas `a` e `b` e deixa as duas iguais."""
+    def linhas(pasta, nome):
+        return ler(os.path.join(pasta, nome))
+
+    limpeza = max(linhas(a, "limpeza.txt")[:1] + linhas(b, "limpeza.txt")[:1], default="")
+    uso = sorted({d for d in linhas(a, "uso.txt") + linhas(b, "uso.txt") if d >= limpeza[:10]})
+
+    # Concluídas: uma por id; as antigas (sem id) valem pela contagem maior das duas pastas
+    com_id, sem_id = {}, Counter()
+    for pasta in (a, b):
+        antigas = Counter()
+        for l in linhas(pasta, "concluidas.tsv"):
+            c = l.split("\t")
+            momento = c[3] if len(c) > 3 else c[0] + "T00:00:00"
+            if momento < limpeza:
+                continue
+            if len(c) > 2 and c[2]:
+                if c[2] not in com_id or momento < com_id[c[2]][0]:
+                    com_id[c[2]] = (momento, l)
+            else:
+                antigas[l] += 1
+        sem_id |= antigas
+    concluidas = sorted(sem_id.elements()) + [l for _, l in sorted(com_id.values())]
+
+    removidas = sorted(set(linhas(a, "removidas.txt")) | set(linhas(b, "removidas.txt")))
+    tarefas, vistas = [], set(removidas)
+    for l in linhas(a, "tarefas.tsv") + linhas(b, "tarefas.tsv"):  # em conflito, vale a de `a`
+        if l.split("\t")[0] not in vistas:
+            vistas.add(l.split("\t")[0])
+            tarefas.append(l)
+    tarefas.sort(key=lambda l: l.split("\t")[0])
+
+    da, db = linhas(a, "desenho.txt"), linhas(b, "desenho.txt")
+    desenho = db if db[:1] > da[:1] else da  # vale o desenho editado por último
+
+    for nome, conteudo in (("uso.txt", uso), ("concluidas.tsv", concluidas), ("removidas.txt", removidas),
+                           ("tarefas.tsv", tarefas), ("desenho.txt", desenho),
+                           ("limpeza.txt", [limpeza] if limpeza else [])):
+        for pasta in (a, b):
+            if conteudo or os.path.exists(os.path.join(pasta, nome)):
+                gravar(os.path.join(pasta, nome), conteudo)
+
+
+def _git(*args, cwd=None):
+    ambiente = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    ambiente.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=10")
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, env=ambiente, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, "", "tempo esgotado")
+
+
+def _erro(r):
+    linhas = [l for l in (r.stderr or r.stdout).strip().splitlines() if l.strip()]
+    return linhas[-1] if linhas else "erro desconhecido"
+
+
+def sincronizar(repo):
+    """Envia e recebe os dados pelo repositório git `repo`. Devolve (deu_certo, mensagem)."""
+    if not repo:
+        return False, "Nenhum repositório configurado."
+    if not shutil.which("git"):
+        return False, "O git não está instalado."
+    ler_tarefas()  # converte a lista do formato antigo, se ainda existir
+    if os.path.isdir(SYNC) and _git("remote", "get-url", "origin", cwd=SYNC).stdout.strip() != repo:
+        shutil.rmtree(SYNC)
+    if not os.path.isdir(SYNC):
+        os.makedirs(os.path.dirname(SYNC), exist_ok=True)
+        r = _git("clone", "--quiet", repo, SYNC)
+        if r.returncode:
+            shutil.rmtree(SYNC, ignore_errors=True)
+            return False, "Não consegui acessar o repositório: " + _erro(r)
+        _git("checkout", "-q", "-B", "main", cwd=SYNC)
+    identidade = [] if _git("config", "user.email", cwd=SYNC).stdout.strip() else \
+        ["-c", "user.name=constancia", "-c", "user.email=constancia@localhost"]
+    r = None
+    for _tentativa in range(2):
+        r = _git("fetch", "--quiet", "origin", cwd=SYNC)
+        if r.returncode:
+            return False, "Sem acesso ao repositório: " + _erro(r)
+        if _git("rev-parse", "-q", "--verify", "origin/main", cwd=SYNC).returncode == 0:
+            _git("reset", "-q", "--hard", "origin/main", cwd=SYNC)
+        mesclar(DIR, SYNC)
+        _git("add", "-A", cwd=SYNC)
+        if _git("status", "--porcelain", cwd=SYNC).stdout.strip():
+            r = _git(*identidade, "commit", "-q", "-m", f"constancia: {os.uname().nodename} {agora_iso()}", cwd=SYNC)
+            if r.returncode:
+                return False, "Erro ao registrar os dados: " + _erro(r)
+        elif _git("rev-parse", "-q", "--verify", "HEAD", cwd=SYNC).returncode:
+            return True, "Nada para sincronizar ainda."
+        elif _git("rev-parse", "HEAD", cwd=SYNC).stdout == _git("rev-parse", "-q", "--verify", "origin/main",
+                                                             cwd=SYNC).stdout:
+            return True, f"Sincronizado às {datetime.now():%H:%M}."
+        r = _git("push", "--quiet", "-u", "origin", "main", cwd=SYNC)
+        if r.returncode == 0:
+            return True, f"Sincronizado às {datetime.now():%H:%M}."
+    return False, "Não consegui enviar os dados: " + _erro(r)
+
+
+# ---------- clima (wttr.in) ----------
+
+def icone_clima(codigo):
+    if codigo == 113: return "☀️"
+    if codigo == 116: return "⛅"
+    if codigo in (119, 122): return "☁️"
+    if codigo in (143, 248, 260): return "🌫️"
+    if codigo in (200, 386, 389, 392, 395): return "⛈️"
+    if codigo in (179, 227, 230, 323, 326, 329, 332, 335, 338, 368, 371): return "❄️"
+    return "🌧️"
+
+
+def obter_clima(forcar=False):
+    """Clima atual e previsão de 3 dias; usa cache e devolve None se não houver dados."""
+    antigo = ler_json(CLIMA) or None
+    if antigo and not forcar and time.time() - antigo.get("quando", 0) < CLIMA_TTL:
+        return antigo
+    try:
+        import urllib.parse
+        import urllib.request
+        cidade = urllib.parse.quote(ler(CIDADE)[0]) if ler(CIDADE) else ""
+        req = urllib.request.Request(f"https://wttr.in/{cidade}?format=j1&lang=pt", headers={"User-Agent": "curl/8"})
+        d = json.load(urllib.request.urlopen(req, timeout=6))
+        c = d["current_condition"][0]
+        novo = {
+            "quando": time.time(),
+            "cidade": ler(CIDADE)[0] if ler(CIDADE) else d["nearest_area"][0]["areaName"][0]["value"],
+            "temp": int(c["temp_C"]),
+            "sensacao": int(c["FeelsLikeC"]),
+            "descricao": c.get("lang_pt", c["weatherDesc"])[0]["value"].strip(),
+            "umidade": int(c["humidity"]),
+            "vento": int(c["windspeedKmph"]),
+            "codigo": int(c["weatherCode"]),
+            "previsao": [[int(w["mintempC"]), int(w["maxtempC"])] for w in d["weather"][:3]],
+        }
+        gravar_json(CLIMA, novo)
+        return novo
+    except Exception:
+        return antigo
+
+
+def mostrar_clima(forcar=False):
+    c = obter_clima(forcar)
+    if not c:
+        print(fraco("clima indisponível (sem internet?)"))
+        return
+    print(f"{icone_clima(c['codigo'])}  {titulo(c['cidade'])}  {destaque(str(c['temp']) + '°C')} "
+          f"{fraco('(sensação ' + str(c['sensacao']) + '°C)')}  {c['descricao']}  "
+          f"{fraco('umidade ' + str(c['umidade']) + '%  vento ' + str(c['vento']) + ' km/h')}")
+    print("   " + "   ".join(f"{fraco(n)} {destaque(f'{lo}–{hi}°C')}"
+                             for n, (lo, hi) in zip(["hoje", "amanhã", "depois"], c["previsao"])))
+
+
+# ---------- configurações ----------
+
+PADRAO = {
+    "fundo": "#14161c",        # cor de fundo do painel
+    "opacidade": 80,           # 30 (bem transparente) a 100 (opaco)
+    "destaque": "#ff6b86",     # títulos das seções e contorno do desenho
+    "grafico": "#39d353",      # quadradinhos do gráfico e números
+    "formato": "quadrado",     # formato dos dias no gráfico: quadrado ou redondo
+    "mostrar_clima": True,
+    "notificacoes": True,      # alarmes e lembretes aparecem como notificação
+    "som": True,               # toca um som nos alarmes
+    "lembrete": False,         # lembrete diário das tarefas pendentes
+    "lembrete_hora": "18:00",
+    "sync_repo": "",           # endereço git do repositório de sincronização
+}
+
+
+def ler_config():
+    cfg = dict(PADRAO)
+    cfg.update({k: v for k, v in ler_json(CONFIG).items() if k in PADRAO and type(v) is type(PADRAO[k])})
+    return cfg
+
+
+def rgb(hexa):
+    try:
+        h = hexa.lstrip("#")
+        return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except (ValueError, AttributeError):
+        return (0.5, 0.5, 0.5)
+
+
+def fundo_claro(cfg):
+    r, g, b = rgb(cfg["fundo"])
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.6
+
+
+# ---------- desenho com cairo (painel e imagem para compartilhar) ----------
+
+CELULA, PASSO, MARGEM_ESQ, MARGEM_TOPO = 11, 14, 30, 18
+GRAFICO_LARGURA = MARGEM_ESQ + 53 * PASSO
+GRAFICO_ALTURA = MARGEM_TOPO + 7 * PASSO
+ALFAS = [0.30, 0.52, 0.76, 1.0]  # intensidade da cor do gráfico nos níveis 1 a 4
+
+
+def semanas_que_cabem(largura):
+    return max(4, min(53, int(largura - MARGEM_ESQ) // PASSO))
+
+
+def desenhar_grafico(cr, largura, atividade, cfg=PADRAO, semanas=None, futuro=False):
+    """Desenha o gráfico de atividade. Dias do desenho ganham contorno enquanto vazios
+    e ficam na cor cheia quando têm atividade. `futuro` mostra também os dias que virão."""
+    import math
+    if semanas is None:
+        semanas = atividade.semanas(semanas_que_cabem(largura))
+    texto = (0, 0, 0) if fundo_claro(cfg) else (1, 1, 1)
+    base, contorno = rgb(cfg["grafico"]), rgb(cfg["destaque"])
+    cr.select_font_face("sans-serif")
+    cr.set_font_size(10)
+    cr.set_source_rgba(*texto, 0.55)
+    for i, nome in rotulos_meses(semanas):
+        cr.move_to(MARGEM_ESQ + i * PASSO, 10)
+        cr.show_text(nome)
+    for r, nome in ((1, "seg"), (3, "qua"), (5, "sex")):
+        cr.move_to(0, MARGEM_TOPO + r * PASSO + CELULA - 2)
+        cr.show_text(nome)
+
+    def forma(x, y, folga=0.0):
+        t, raio = CELULA - 2 * folga, 2.5
+        x, y = x + folga, y + folga
+        cr.new_sub_path()
+        if cfg["formato"] == "redondo":
+            cr.arc(x + t / 2, y + t / 2, t / 2, 0, 2 * math.pi)
+        else:
+            cr.arc(x + t - raio, y + raio, raio, -math.pi / 2, 0)
+            cr.arc(x + t - raio, y + t - raio, raio, 0, math.pi / 2)
+            cr.arc(x + raio, y + t - raio, raio, math.pi / 2, math.pi)
+            cr.arc(x + raio, y + raio, raio, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    for i, semana in enumerate(semanas):
+        for r, dia in enumerate(semana):
+            if dia > atividade.hoje and not futuro:
+                continue
+            x, y = MARGEM_ESQ + i * PASSO, MARGEM_TOPO + r * PASSO
+            pontos = atividade.pontos(dia)
+            marcado = dia.isoformat() in atividade.desenho
+            forma(x, y)
+            if pontos and marcado:
+                cr.set_source_rgba(*base, 1)
+            elif pontos:
+                cr.set_source_rgba(*base, ALFAS[nivel(pontos) - 1])
+            else:
+                cr.set_source_rgba(*texto, 0.10)
+            cr.fill()
+            if marcado and not pontos:
+                forma(x, y, 0.75)
+                cr.set_source_rgba(*contorno, 1)
+                cr.set_line_width(1.5)
+                cr.stroke()
+
+
+def desenhar_barras(cr, largura, altura, valores, cor_barra, cor_texto):
+    """Barras de tarefas concluídas por semana; valores = [(primeiro dia, total)]."""
+    cr.select_font_face("sans-serif")
+    cr.set_font_size(10)
+    passo = largura / max(1, len(valores))
+    barra = min(28, passo * 0.6)
+    topo, base = 14, altura - 16
+    maior = max(1, max(v for _, v in valores))
+    for i, (dia, v) in enumerate(valores):
+        x = i * passo + (passo - barra) / 2
+        h = max(2, (base - topo) * v / maior)
+        cr.set_source_rgba(*cor_barra, 1 if v else 0.25)
+        cr.rectangle(x, base - h, barra, h)
+        cr.fill()
+        cr.set_source_rgba(*cor_texto, 0.6)
+        for texto, y in ((str(v) if v else "", base - h - 3), (f"{dia.day:02}/{dia.month:02}", altura - 3)):
+            cr.move_to(i * passo + (passo - cr.text_extents(texto).width) / 2, y)
+            cr.show_text(texto)
+
+
+def gerar_imagem(caminho, cfg=None, com_resumo=True):
+    """Salva um PNG para compartilhar: o gráfico, com ou sem o título e o resumo acima dele."""
+    import cairo
+    cfg = cfg or ler_config()
+    a = Atividade()
+    margem, escala = 32, 2
+    topo = 80 if com_resumo else margem - 6
+    largura, altura = GRAFICO_LARGURA + 2 * margem, GRAFICO_ALTURA + topo + 28
+    superficie = cairo.ImageSurface(cairo.FORMAT_ARGB32, largura * escala, altura * escala)
+    cr = cairo.Context(superficie)
+    cr.scale(escala, escala)
+    cr.set_source_rgb(*rgb(cfg["fundo"]))
+    cr.paint()
+    texto = (0, 0, 0) if fundo_claro(cfg) else (1, 1, 1)
+    if com_resumo:
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(17)
+        cr.set_source_rgb(*rgb(cfg["destaque"]))
+        cr.move_to(margem, 40)
+        cr.show_text("Constância")
+        cr.select_font_face("sans-serif")
+        cr.set_font_size(12)
+        cr.set_source_rgba(*texto, 0.8)
+        cr.move_to(margem, 62)
+        cr.show_text(f"{linha_resumo(a)} · recorde de {a.recorde} {plural(a.recorde, 'dia seguido', 'dias seguidos')}")
+    cr.translate(margem, topo)
+    desenhar_grafico(cr, GRAFICO_LARGURA, a, cfg)
+    os.makedirs(os.path.dirname(os.path.abspath(caminho)), exist_ok=True)
+    superficie.write_to_png(caminho)
+    return caminho
+
+
+# ---------- painel (janela GTK) ----------
+
+SOM_ALARME = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+
+CSS = """
+window.painel { background-color: rgba(@FUNDO@, @OPACIDADE@); border-radius: 16px; color: @TEXTO@; }
+.painel .secao { font-size: 11px; font-weight: bold; letter-spacing: 1.5px; color: @DESTAQUE@; }
+.painel .temp { font-size: 40px; font-weight: 300; }
+.painel .icone { font-size: 34px; }
+.painel .fraco { color: rgba(@T@, 0.55); }
+.painel .numero { color: @GRAFICO@; font-weight: bold; }
+.painel entry { background-color: rgba(@T@, 0.08); border: none; box-shadow: none;
+                border-radius: 8px; color: @TEXTO@; min-height: 32px; }
+.painel checkbutton { padding: 2px 0; }
+.painel button.flat, .painel menubutton.flat > button {
+    min-height: 24px; min-width: 24px; padding: 0 4px; color: rgba(@T@, 0.45); font-size: 12px; }
+.painel button.flat:hover, .painel menubutton.flat > button:hover {
+    color: @TEXTO@; background-color: rgba(@T@, 0.10); }
+.painel scrolledwindow { background: none; }
+.constancia-numero { font-size: 26px; font-weight: 300; }
+.constancia-legenda { font-size: 12px; opacity: 0.6; }
+.constancia-dia { font-weight: bold; margin-top: 10px; }
+"""
+
+
+def gerar_css(cfg):
+    claro = fundo_claro(cfg)
+    trocas = {
+        "@FUNDO@": ", ".join(str(round(c * 255)) for c in rgb(cfg["fundo"])),
+        "@OPACIDADE@": str(max(30, min(100, cfg["opacidade"])) / 100),
+        "@TEXTO@": "#1c1c1e" if claro else "#e8e8ea",
+        "@T@": "0, 0, 0" if claro else "255, 255, 255",
+        "@DESTAQUE@": cfg["destaque"],
+        "@GRAFICO@": cfg["grafico"],
+    }
+    css = CSS
+    for marca, valor in trocas.items():
+        css = css.replace(marca, valor)
+    return css
+
+
+def painel():
+    import threading
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, Gio, GLib, Gtk
+
+    cfg = ler_config()
+    estado = {}
+
+    def rotulo(texto="", *classes, **props):
+        w = Gtk.Label(label=texto, xalign=0, **props)
+        for c in classes:
+            w.add_css_class(c)
+        return w
+
+    def botao(icone, dica, ao_clicar):
+        b = Gtk.Button(icon_name=icone, valign=Gtk.Align.START, tooltip_text=dica)
+        b.add_css_class("flat")
+        b.connect("clicked", lambda *_: ao_clicar())
+        return b
+
+    def esvaziar(caixa):
+        while caixa.get_first_child():
+            caixa.remove(caixa.get_first_child())
+
+    def ao_ativar(app):
+        if app.get_active_window():
+            app.get_active_window().present()
+            return
+        provedor = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # resizable=False faz a janela ter sempre o tamanho exato do conteúdo
+        janela = Gtk.ApplicationWindow(application=app, title="Constância", decorated=False, resizable=False)
+        janela.add_css_class("painel")
+        caixa = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                        margin_top=18, margin_bottom=20, margin_start=24, margin_end=24)
+        janela.set_child(Gtk.WindowHandle(child=caixa))  # arrastar em qualquer ponto move a janela
+
+        # --- clima e botões ---
+        topo = Gtk.Box(spacing=14)
+        icone = rotulo("", "icone")
+        temp = rotulo("--°", "temp")
+        textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        clima_linha1 = rotulo("Carregando clima…")
+        clima_linha2 = rotulo("", "fraco")
+        clima_linha3 = rotulo("", "fraco")
+        for w in (clima_linha1, clima_linha2, clima_linha3):
+            textos.append(w)
+        botoes = Gtk.Box(spacing=2, valign=Gtk.Align.START)
+        botoes.append(botao("document-open-recent-symbolic", "Histórico, resumo e progresso",
+                            lambda: abrir_historico()))
+        botoes.append(botao("emblem-system-symbolic", "Configurações", lambda: abrir_configuracoes()))
+        botoes.append(botao("window-close-symbolic", "Fechar", janela.close))
+        for w in (icone, temp, textos, Gtk.Box(hexpand=True), botoes):
+            topo.append(w)
+        caixa.append(topo)
+
+        def aplicar_clima(c):
+            if not c:
+                clima_linha1.set_label("Clima indisponível (sem internet?)")
+                return False
+            icone.set_label(icone_clima(c["codigo"]))
+            temp.set_label(f"{c['temp']}°")
+            clima_linha1.set_label(f"{c['cidade']} · {c['descricao']}")
+            clima_linha2.set_label(f"sensação {c['sensacao']}° · umidade {c['umidade']}% · vento {c['vento']} km/h")
+            clima_linha3.set_label("   ".join(f"{n} {lo}–{hi}°" for n, (lo, hi) in
+                                              zip(["hoje", "amanhã", "depois"], c["previsao"])))
+            return False
+
+        def atualizar_clima(forcar=False):
+            if cfg["mostrar_clima"]:
+                threading.Thread(target=lambda: GLib.idle_add(aplicar_clima, obter_clima(forcar)),
+                                 daemon=True).start()
+
+        # --- notificações e alarmes ---
+        def notificar(titulo_, corpo, identificador, urgente=False):
+            if cfg["notificacoes"]:
+                n = Gio.Notification.new(titulo_)
+                n.set_body(corpo)
+                if urgente:
+                    n.set_priority(Gio.NotificationPriority.URGENT)
+                app.send_notification(identificador, n)
+
+        def tocar_alarme():
+            if not cfg["som"]:
+                return
+            for programa in ("pw-play", "paplay"):
+                if shutil.which(programa) and os.path.exists(SOM_ALARME):
+                    subprocess.Popen([programa, SOM_ALARME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+            Gdk.Display.get_default().beep()
+
+        def verificar_alarmes():
+            for t in alarmes_vencidos():
+                notificar(t["texto"], "Alarme da tarefa", "alarme-" + t["id"], urgente=True)
+                tocar_alarme()
+            hoje = date.today().isoformat()
+            if (cfg["lembrete"] and datetime.now().strftime("%H:%M") >= cfg["lembrete_hora"]
+                    and ler_json(ESTADO).get("lembrado") != hoje):
+                gravar_json(ESTADO, dict(ler_json(ESTADO), lembrado=hoje))
+                pendentes, a = len(ler_tarefas()), Atividade()
+                partes = []
+                if pendentes:
+                    partes.append(f"{pendentes} {plural(pendentes, 'tarefa pendente', 'tarefas pendentes')}")
+                if not a.feitas[hoje]:
+                    partes.append("nenhuma tarefa concluída hoje")
+                if hoje in a.desenho:
+                    partes.append("hoje é dia do desenho")
+                if pendentes or hoje in a.desenho:
+                    notificar("Constância", " · ".join(partes).capitalize() + ".", "lembrete")
+            return True
+
+        # --- tarefas ---
+        caixa.append(rotulo("TAREFAS", "secao", margin_top=8))
+        lista = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        rolagem = Gtk.ScrolledWindow(child=lista, propagate_natural_height=True, max_content_height=240,
+                                     hscrollbar_policy=Gtk.PolicyType.NEVER)
+        caixa.append(rolagem)
+        entrada = Gtk.Entry(placeholder_text="Nova tarefa… (Enter para adicionar)")
+        caixa.append(entrada)
+
+        def ao_adicionar(_):
+            if entrada.get_text().strip():
+                adicionar(entrada.get_text())
+                entrada.set_text("")
+                recarregar()
+
+        entrada.connect("activate", ao_adicionar)
+
+        def ao_retirar(_, n, concluir):
+            retirar([n], concluir)
+            recarregar()
+
+        def ao_alarme(campo, id_tarefa, balao):
+            texto = campo.get_text().strip()
+            try:
+                alarme = interpretar_alarme(texto) if texto else ""
+            except ValueError:
+                campo.add_css_class("error")
+                return
+            balao.popdown()
+            definir_alarme(id_tarefa, alarme)
+            recarregar()
+
+        def botao_alarme(t):
+            campo = Gtk.Entry(text=formatar_alarme(t["alarme"]), placeholder_text="14:30 ou 25/12 09:00",
+                              width_chars=20)
+            conteudo = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                               margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+            conteudo.append(Gtk.Label(label="Alarme (Enter confirma; vazio remove)", xalign=0))
+            conteudo.append(campo)
+            balao = Gtk.Popover(child=conteudo)
+            campo.connect("activate", ao_alarme, t["id"], balao)
+            tema = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            desenho_sino = Gtk.Box(spacing=5)
+            desenho_sino.append(Gtk.Image(icon_name="alarm-symbolic" if tema.has_icon("alarm-symbolic")
+                                          else "appointment-soon-symbolic", pixel_size=14))
+            if t["alarme"]:
+                desenho_sino.append(Gtk.Label(label=formatar_alarme(t["alarme"])))
+            sino = Gtk.MenuButton(child=desenho_sino, popover=balao, has_frame=False,
+                                  tooltip_text="Alarme desta tarefa")
+            sino.add_css_class("flat")
+            return sino
+
+        # --- gráfico ---
+        def compartilhar_imagem(com_resumo):
+            """Salva a imagem na pasta de imagens, copia para a área de transferência e devolve o caminho."""
+            pasta = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or os.path.expanduser("~")
+            nome = f"constancia-{'' if com_resumo else 'grafico-'}{date.today().isoformat()}.png"
+            caminho = gerar_imagem(os.path.join(pasta, nome), cfg, com_resumo)
+            Gdk.Display.get_default().get_clipboard().set_content(
+                Gdk.ContentProvider.new_for_value(Gdk.Texture.new_from_filename(caminho)))
+            return caminho
+
+        def botao_compartilhar():
+            aviso = Gtk.Label(label="A imagem é salva na pasta de imagens e copiada para colar.",
+                              xalign=0, wrap=True, max_width_chars=34)
+            aviso.add_css_class("constancia-legenda")
+            conteudo = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                               margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+            for texto, com_resumo in (("Só o gráfico", False), ("Gráfico com resumo", True)):
+                b = Gtk.Button(label=texto)
+                b.connect("clicked", lambda _b, r: aviso.set_label(
+                    f"Copiada. Salva em {compartilhar_imagem(r)}"), com_resumo)
+                conteudo.append(b)
+            conteudo.append(aviso)
+            m = Gtk.MenuButton(icon_name="send-to-symbolic", popover=Gtk.Popover(child=conteudo),
+                               has_frame=False, tooltip_text="Compartilhar o gráfico")
+            m.add_css_class("flat")
+            return m
+
+        resumo = Gtk.Box(spacing=6, hexpand=True, valign=Gtk.Align.CENTER)
+        linha_atividade = Gtk.Box(spacing=6, margin_top=8)
+        linha_atividade.append(resumo)
+        linha_atividade.append(botao_compartilhar())
+        caixa.append(linha_atividade)
+        estado["atividade"] = Atividade()
+        area = Gtk.DrawingArea(content_width=GRAFICO_LARGURA, content_height=GRAFICO_ALTURA,
+                               has_tooltip=True, hexpand=True)
+        area.set_draw_func(lambda _a, cr, w, _h: desenhar_grafico(cr, w, estado["atividade"], cfg))
+        caixa.append(area)
+
+        def ao_dica(_a, x, y, _teclado, dica):
+            a = estado["atividade"]
+            semanas = a.semanas(semanas_que_cabem(area.get_width()))
+            i, r = int(x - MARGEM_ESQ) // PASSO, int(y - MARGEM_TOPO) // PASSO
+            if x < MARGEM_ESQ or y < MARGEM_TOPO or not (0 <= i < len(semanas) and 0 <= r < 7) or semanas[i][r] > a.hoje:
+                return False
+            dica.set_text(a.descrever(semanas[i][r]))
+            return True
+
+        area.connect("query-tooltip", ao_dica)
+
+        def recarregar():
+            estado["pendente"] = 0
+            esvaziar(lista)
+            tarefas = ler_tarefas()
+            if not tarefas:
+                lista.append(rotulo("Nenhuma tarefa pendente.", "fraco"))
+            for n, t in enumerate(tarefas, 1):
+                linha = Gtk.Box(spacing=4)
+                marca = Gtk.CheckButton(label=t["texto"], hexpand=True, tooltip_text=t["texto"])
+                marca.get_last_child().set_ellipsize(3)  # corta com "…" no fim; o texto todo fica na dica
+                marca.connect("toggled", ao_retirar, n, True)
+                remover = Gtk.Button(icon_name="edit-delete-symbolic", tooltip_text="Remover sem contar")
+                remover.add_css_class("flat")
+                remover.connect("clicked", ao_retirar, n, False)
+                for w in (marca, botao_alarme(t), remover):
+                    linha.append(w)
+                lista.append(linha)
+
+            a = estado["atividade"] = Atividade()
+            esvaziar(resumo)
+            resumo.append(rotulo("ATIVIDADE", "secao", margin_end=10))
+            for valor, um, varios in ((len(a.uso), "dia de uso", "dias de uso"),
+                                      (a.total_feitas, "tarefa concluída", "tarefas concluídas"),
+                                      (a.seguidos, "dia seguido", "dias seguidos")):
+                resumo.append(rotulo(str(valor), "numero"))
+                resumo.append(rotulo(plural(valor, um, varios), "fraco", margin_end=10))
+            area.queue_draw()
+            return False
+
+        def aplicar_aparencia():
+            Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", not fundo_claro(cfg))
+            provedor.load_from_string(gerar_css(cfg))
+            for w in (icone, temp, textos):
+                w.set_visible(cfg["mostrar_clima"])
+            area.queue_draw()
+
+        def mudar(chave, valor):
+            if cfg[chave] != valor:
+                cfg[chave] = valor
+                gravar_json(CONFIG, cfg)
+                aplicar_aparencia()
+                if chave == "mostrar_clima":
+                    atualizar_clima()
+
+        # --- sincronização ---
+        def sincronizar_em_segundo_plano():
+            if not cfg["sync_repo"] or estado.get("sincronizando"):
+                return
+            estado["sincronizando"] = True
+            mostrar_sync("Sincronizando…")
+
+            def fim(resultado):
+                estado["sincronizando"] = False
+                mostrar_sync(resultado[1])
+                return False
+
+            threading.Thread(target=lambda: GLib.idle_add(fim, sincronizar(cfg["sync_repo"])), daemon=True).start()
+
+        def mostrar_sync(mensagem):
+            estado["sync_msg"] = mensagem
+            if estado.get("sync_rotulo"):
+                estado["sync_rotulo"].set_label(mensagem)
+
+        def janela_auxiliar(chave, titulo_janela, largura, altura, redimensionavel=True):
+            """Abre (ou traz para frente) uma janela secundária única."""
+            if estado.get(chave):
+                estado[chave].present()
+                return None
+            w = Gtk.Window(application=app, title=titulo_janela, default_width=largura, default_height=altura,
+                           resizable=redimensionavel)
+
+            def ao_fechar(*_):
+                estado[chave] = None
+                if chave == "config":
+                    estado["sync_rotulo"] = None
+                return False
+
+            w.connect("close-request", ao_fechar)
+            estado[chave] = w
+            return w
+
+        # --- janela de configurações ---
+        def abrir_configuracoes():
+            w = janela_auxiliar("config", "Configurações do Constância", 500, 680)
+            if not w:
+                return
+            grade = Gtk.Grid(row_spacing=12, column_spacing=18,
+                             margin_top=18, margin_bottom=20, margin_start=22, margin_end=22)
+            w.set_child(Gtk.ScrolledWindow(child=grade, hscrollbar_policy=Gtk.PolicyType.NEVER))
+            controles = {}
+            n = [0]
+
+            def secao(texto):
+                grade.attach(rotulo(texto, "constancia-dia"), 0, n[0], 2, 1)
+                n[0] += 1
+
+            def linha(texto, controle):
+                grade.attach(Gtk.Label(label=texto, xalign=0, hexpand=True), 0, n[0], 1, 1)
+                controle.set_halign(Gtk.Align.END)
+                grade.attach(controle, 1, n[0], 1, 1)
+                n[0] += 1
+
+            def seletor_cor(chave):
+                rgba = Gdk.RGBA()
+                rgba.parse(cfg[chave])
+                b = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), rgba=rgba)
+                b.connect("notify::rgba", lambda *_: mudar(chave, "#%02x%02x%02x" % tuple(
+                    round(c * 255) for c in (b.get_rgba().red, b.get_rgba().green, b.get_rgba().blue))))
+                controles[chave] = b
+                return b
+
+            def chave_liga(chave):
+                s = Gtk.Switch(active=cfg[chave])
+                s.connect("notify::active", lambda s_, _p: mudar(chave, s_.get_active()))
+                controles[chave] = s
+                return s
+
+            secao("Aparência")
+            linha("Cor de fundo", seletor_cor("fundo"))
+            opacidade = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 30, 100, 5)
+            opacidade.set_value(cfg["opacidade"])
+            opacidade.set_size_request(170, -1)
+            opacidade.set_draw_value(True)
+            opacidade.set_format_value_func(lambda _s, v: f"{int(v)}%")
+            opacidade.connect("value-changed", lambda s: mudar("opacidade", int(s.get_value())))
+            linha("Opacidade do fundo", opacidade)
+            linha("Cor dos títulos", seletor_cor("destaque"))
+            linha("Cor do gráfico", seletor_cor("grafico"))
+            formatos = ["quadrado", "redondo"]
+            formato = Gtk.DropDown.new_from_strings(["Quadrados", "Círculos"])
+            formato.set_selected(formatos.index(cfg["formato"]) if cfg["formato"] in formatos else 0)
+            formato.connect("notify::selected", lambda d, _p: mudar("formato", formatos[d.get_selected()]))
+            linha("Formato dos dias", formato)
+            desenho = Gtk.Button(label="Editar desenho…")
+            desenho.connect("clicked", lambda *_: abrir_desenho())
+            linha("Desenho no gráfico", desenho)
+
+            secao("Clima")
+            linha("Mostrar o clima", chave_liga("mostrar_clima"))
+            cidade = Gtk.Entry(text=(ler(CIDADE) or [""])[0], placeholder_text="detectar sozinho", width_chars=18)
+
+            def ao_cidade(*_):
+                nome = cidade.get_text().strip()
+                if nome != (ler(CIDADE) or [""])[0]:
+                    if nome:
+                        gravar(CIDADE, [nome])
+                    elif os.path.exists(CIDADE):
+                        os.remove(CIDADE)
+                    atualizar_clima(forcar=True)
+
+            cidade.connect("activate", ao_cidade)
+            linha("Cidade (Enter aplica)", cidade)
+
+            secao("Alarmes e notificações")
+            linha("Mostrar notificações", chave_liga("notificacoes"))
+            linha("Som nos alarmes", chave_liga("som"))
+            linha("Lembrete diário das tarefas", chave_liga("lembrete"))
+            hora = Gtk.Entry(text=cfg["lembrete_hora"], width_chars=6, max_length=5)
+
+            def ao_hora(*_):
+                m = re.fullmatch(r"(\d{1,2}):(\d{2})", hora.get_text().strip())
+                if m and int(m[1]) < 24 and int(m[2]) < 60:
+                    hora.remove_css_class("error")
+                    mudar("lembrete_hora", f"{int(m[1]):02}:{m[2]}")
+                    hora.set_text(cfg["lembrete_hora"])
+                    gravar_json(ESTADO, dict(ler_json(ESTADO), lembrado=""))  # vale ainda hoje
+                else:
+                    hora.add_css_class("error")
+
+            hora.connect("activate", ao_hora)
+            linha("Hora do lembrete (Enter aplica)", hora)
+
+            secao("Sincronização entre computadores")
+            grade.attach(rotulo("Crie um repositório PRIVADO no GitHub e cole o endereço dele aqui, em cada "
+                                "computador. Este computador precisa já ter acesso ao GitHub pelo git.",
+                                "constancia-legenda", wrap=True, max_width_chars=52), 0, n[0], 2, 1)
+            n[0] += 1
+            repo = Gtk.Entry(text=cfg["sync_repo"], hexpand=True,
+                             placeholder_text="git@github.com:usuario/constancia-dados.git")
+            sincroniza = Gtk.Button(label="Sincronizar agora")
+
+            def ao_sincronizar(*_):
+                mudar("sync_repo", repo.get_text().strip())
+                if cfg["sync_repo"]:
+                    sincronizar_em_segundo_plano()
+                else:
+                    mostrar_sync("Sincronização desligada.")
+
+            repo.connect("activate", ao_sincronizar)
+            sincroniza.connect("clicked", ao_sincronizar)
+            grade.attach(repo, 0, n[0], 1, 1)
+            grade.attach(sincroniza, 1, n[0], 1, 1)
+            n[0] += 1
+            estado["sync_rotulo"] = rotulo(estado.get("sync_msg", ""), "constancia-legenda",
+                                           wrap=True, max_width_chars=52)
+            grade.attach(estado["sync_rotulo"], 0, n[0], 2, 1)
+            n[0] += 1
+
+            def restaurar(*_):
+                rgba = Gdk.RGBA()
+                for chave in ("fundo", "destaque", "grafico"):
+                    rgba.parse(PADRAO[chave])
+                    controles[chave].set_rgba(rgba)
+                opacidade.set_value(PADRAO["opacidade"])
+                formato.set_selected(0)
+
+            padrao = Gtk.Button(label="Restaurar aparência padrão")
+            padrao.connect("clicked", restaurar)
+            linha("As mudanças valem na hora.", padrao)
+            w.present()
+
+        # --- editor do desenho ---
+        def abrir_desenho():
+            w = janela_auxiliar("desenho", "Desenho no gráfico", -1, -1, redimensionavel=False)
+            if not w:
+                return
+            a = Atividade()
+            dias = a.desenho  # o mesmo conjunto que o gráfico do editor mostra
+            inicio = a.hoje - timedelta(days=(a.hoje.weekday() + 1) % 7 + 7 * 8)
+            semanas = a.semanas(53, inicio)
+            pagina = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                             margin_top=18, margin_bottom=18, margin_start=22, margin_end=22)
+            w.set_child(pagina)
+            pagina.append(rotulo("Clique ou arraste para marcar os dias que formam o seu desenho. No gráfico, os dias "
+                                 "marcados aparecem com contorno e ficam cheios quando você usa o computador ou "
+                                 "conclui tarefas neles. O editor mostra as últimas 8 semanas e as próximas 44.",
+                                 wrap=True, max_width_chars=90))
+            tela = Gtk.DrawingArea(content_width=GRAFICO_LARGURA, content_height=GRAFICO_ALTURA)
+            tela.set_draw_func(lambda _a, cr, largura, _h: desenhar_grafico(cr, largura, a, cfg, semanas, futuro=True))
+            pagina.append(tela)
+            contagem = rotulo("", "constancia-legenda", hexpand=True)
+            modo = {"marcar": True}
+
+            def atualizar():
+                contagem.set_label(f"{len(dias)} {plural(len(dias), 'dia marcado', 'dias marcados')}")
+                tela.queue_draw()
+
+            def dia_em(x, y):
+                i, r = int(x - MARGEM_ESQ) // PASSO, int(y - MARGEM_TOPO) // PASSO
+                if x < MARGEM_ESQ or y < MARGEM_TOPO or not (0 <= i < len(semanas) and 0 <= r < 7):
+                    return None
+                return semanas[i][r].isoformat()
+
+            def pintar(d):
+                if d and (d in dias) != modo["marcar"]:
+                    (dias.add if modo["marcar"] else dias.discard)(d)
+                    atualizar()
+
+            def ao_comecar(_g, x, y):
+                d = dia_em(x, y)
+                modo["marcar"] = d not in dias
+                pintar(d)
+
+            def ao_arrastar(g, dx, dy):
+                _ok, x0, y0 = g.get_start_point()
+                pintar(dia_em(x0 + dx, y0 + dy))
+
+            arrasto = Gtk.GestureDrag()
+            arrasto.connect("drag-begin", ao_comecar)
+            arrasto.connect("drag-update", ao_arrastar)
+            arrasto.connect("drag-end", lambda *_: gravar_desenho(dias))
+            tela.add_controller(arrasto)
+
+            def limpar(*_):
+                dias.clear()
+                gravar_desenho(dias)
+                atualizar()
+
+            rodape = Gtk.Box(spacing=12)
+            apagar = Gtk.Button(label="Limpar desenho")
+            apagar.connect("clicked", limpar)
+            rodape.append(contagem)
+            rodape.append(apagar)
+            pagina.append(rodape)
+            atualizar()
+            w.present()
+
+        # --- janela de histórico, resumo e progresso ---
+        def abrir_historico():
+            w = janela_auxiliar("historico", "Histórico e progresso", 580, 700)
+            if not w:
+                return
+            dados = {"a": Atividade()}
+            pagina = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                             margin_top=18, margin_bottom=18, margin_start=22, margin_end=22)
+            w.set_child(pagina)
+
+            chaves = list(PERIODOS)
+            periodo = Gtk.DropDown.new_from_strings(list(PERIODOS.values()))
+            periodo.set_selected(chaves.index("semana"))
+            cabecalho = Gtk.Box(spacing=12)
+            cabecalho.append(rotulo("Resumo de", "constancia-dia", margin_top=0))
+            cabecalho.append(periodo)
+            pagina.append(cabecalho)
+            numeros_grade = Gtk.Grid(row_spacing=14, column_spacing=12, column_homogeneous=True)
+            pagina.append(numeros_grade)
+
+            pagina.append(rotulo("Tarefas concluídas por semana", "constancia-dia"))
+            barras = Gtk.DrawingArea(content_height=130, hexpand=True)
+
+            def desenhar(_a, cr, largura, altura):
+                cor_texto = barras.get_color()
+                desenhar_barras(cr, largura, altura, dados["a"].por_semana(12), rgb(cfg["grafico"]),
+                                (cor_texto.red, cor_texto.green, cor_texto.blue))
+
+            barras.set_draw_func(desenhar)
+            pagina.append(barras)
+
+            pagina.append(rotulo("Dia a dia", "constancia-dia"))
+            dias = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_end=12)
+            pagina.append(Gtk.ScrolledWindow(child=dias, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+
+            def preencher(*_):
+                a, chave = dados["a"], chaves[periodo.get_selected()]
+                esvaziar(numeros_grade)
+                for i, (valor, legenda) in enumerate(linhas_do_resumo(a, chave)):
+                    bloco = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                    bloco.append(rotulo(str(valor), "constancia-numero"))
+                    bloco.append(rotulo(legenda, "constancia-legenda", wrap=True))
+                    numeros_grade.attach(bloco, i % 3, i // 3, 1, 1)
+                esvaziar(dias)
+                ativos = a.resumo(chave)["dias"][::-1][:366]
+                if not ativos:
+                    dias.append(rotulo("Nenhuma atividade neste período.", "constancia-legenda"))
+                for d in ativos:
+                    dias.append(rotulo(data_longa(d), "constancia-dia"))
+                    feitas = a.historico.get(d.isoformat(), [])
+                    for t in feitas:
+                        dias.append(rotulo(f"✔  {t}", wrap=True))
+                    if not feitas:
+                        dias.append(rotulo("usou o computador, nenhuma tarefa concluída", "constancia-legenda"))
+                barras.queue_draw()
+
+            periodo.connect("notify::selected", preencher)
+
+            aviso = rotulo("", "constancia-legenda", wrap=True, hexpand=True)
+
+            def compartilhar(*_):
+                aviso.set_label(f"Imagem salva em {compartilhar_imagem(True)} e copiada: "
+                                "é só colar onde quiser compartilhar.")
+
+            def ao_responder(dialogo, resultado):
+                try:
+                    escolha = dialogo.choose_finish(resultado)
+                except GLib.Error:
+                    return
+                if escolha == 1:
+                    excluir_historico()
+                    dados["a"] = Atividade()
+                    preencher()
+                    recarregar()
+                    aviso.set_label("Histórico excluído.")
+
+            def excluir(*_):
+                dialogo = Gtk.AlertDialog(
+                    message="Excluir todo o histórico?",
+                    detail="Os dias de uso e as tarefas concluídas serão apagados, neste computador e nos "
+                           "sincronizados. As tarefas pendentes e o desenho ficam. Isso não pode ser desfeito.",
+                    buttons=["Cancelar", "Excluir"], cancel_button=0, default_button=0)
+                dialogo.choose(w, None, ao_responder)
+
+            rodape = Gtk.Box(spacing=12)
+            b_compartilhar = Gtk.Button(label="Compartilhar imagem")
+            b_compartilhar.connect("clicked", compartilhar)
+            b_excluir = Gtk.Button(label="Excluir histórico…")
+            b_excluir.add_css_class("destructive-action")
+            b_excluir.connect("clicked", excluir)
+            for x in (aviso, b_compartilhar, b_excluir):
+                rodape.append(x)
+            pagina.append(rodape)
+            preencher()
+            w.present()
+
+        # Quando os arquivos mudam (pelo painel, pelo terminal ou pela sincronização):
+        # recarrega logo e sincroniza alguns segundos depois
+        def ao_mudar(*_):
+            if not estado.get("pendente"):
+                estado["pendente"] = GLib.timeout_add(200, recarregar)
+            if estado.get("sync_timer"):
+                GLib.source_remove(estado["sync_timer"])
+
+            def disparar():
+                estado["sync_timer"] = 0
+                sincronizar_em_segundo_plano()
+                return False
+
+            estado["sync_timer"] = GLib.timeout_add_seconds(8, disparar)
+
+        os.makedirs(DIR, exist_ok=True)
+        estado["monitor"] = Gio.File.new_for_path(DIR).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        estado["monitor"].connect("changed", ao_mudar)
+
+        def periodico():
+            if not tela_bloqueada():
+                marcar_hoje()
+            atualizar_clima()
+            recarregar()
+            sincronizar_em_segundo_plano()
+            return True
+
+        marcar_hoje()
+        aplicar_aparencia()
+        recarregar()
+        atualizar_clima()
+        sincronizar_em_segundo_plano()
+        GLib.timeout_add_seconds(600, periodico)
+        GLib.timeout_add_seconds(20, verificar_alarmes)
+        # Fechar o painel encerra o programa, mesmo com outras janelas dele abertas
+        janela.connect("close-request", lambda *_: app.quit())
+        janela.present()
+
+    app = Gtk.Application(application_id=APP_ID)
+    app.connect("activate", ao_ativar)
+    return app.run(None)
+
+
+# ---------- linha de comando ----------
+
+def main():
+    cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
+    if cmd == "painel":
+        sys.exit(painel())
+    elif cmd == "marcar":
+        if not tela_bloqueada():
+            marcar_hoje()
+    elif cmd in ("add", "a"):
+        if not " ".join(args).strip():
+            sys.exit("Uso: constancia add TEXTO DA TAREFA")
+        adicionar(" ".join(args))
+        mostrar_tarefas()
+    elif cmd in ("ok", "feito", "rm"):
+        for t in retirar(numeros(args), concluir=cmd != "rm"):
+            print(fraco(("✘ " if cmd == "rm" else "✔ ") + t))
+        mostrar_tarefas()
+    elif cmd == "alarme":
+        if len(args) < 2:
+            sys.exit('Uso: constancia alarme N HORA   (ex.: "14:30", "25/12 09:00" ou "nenhum")')
+        n = numeros(args[:1])[0]
+        try:
+            alarme = "" if args[1] == "nenhum" else interpretar_alarme(" ".join(args[1:]))
+        except ValueError as e:
+            sys.exit(f"Horário inválido: {e}")
+        definir_alarme(ler_tarefas()[n - 1]["id"], alarme)
+        mostrar_tarefas()
+    elif cmd in ("tarefas", "ls"):
+        mostrar_tarefas()
+    elif cmd in ("grafico", "gráfico"):
+        marcar_hoje()
+        mostrar_grafico()
+    elif cmd == "resumo":
+        mostrar_resumo(args[0] if args else "semana")
+    elif cmd == "compartilhar":
+        so_grafico = "--grafico" in args
+        arquivos = [x for x in args if x != "--grafico"]
+        print("Imagem salva em " + gerar_imagem(
+            arquivos[0] if arquivos else f"constancia-{date.today().isoformat()}.png", com_resumo=not so_grafico))
+    elif cmd == "sync":
+        ok, mensagem = sincronizar(ler_config()["sync_repo"])
+        print(mensagem)
+        sys.exit(0 if ok else 1)
+    elif cmd == "clima":
+        mostrar_clima(forcar="-f" in args)
+    elif cmd == "cidade":
+        nome = " ".join(args).strip()
+        if not nome:
+            sys.exit('Uso: constancia cidade NOME   (ou "constancia cidade auto")')
+        if nome == "auto":
+            if os.path.exists(CIDADE):
+                os.remove(CIDADE)
+        else:
+            gravar(CIDADE, [nome])
+        mostrar_clima(forcar=True)
+    elif cmd == "":
+        marcar_hoje()  # se você está vendo isto, o computador está em uso
+        mostrar_tarefas()
+        print()
+        mostrar_grafico()
+    elif cmd in ("ajuda", "help", "-h", "--help"):
+        print(AJUDA)
+    elif cmd in ("--version", "-V"):
+        print(f"constancia {VERSAO}")
+    else:
+        sys.exit(f"Comando desconhecido: {cmd}\n\n{AJUDA}")
+
+
+if __name__ == "__main__":
+    main()

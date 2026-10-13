@@ -1,0 +1,9 @@
+[Unit]
+Description=constancia: verifica a cada 10 minutos se o computador está em uso
+
+[Timer]
+OnCalendar=*:0/10
+OnStartupSec=1min
+
+[Install]
+WantedBy=timers.target
