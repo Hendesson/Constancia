@@ -105,13 +105,28 @@ passa a valer depois de sair da sessão e entrar de novo. Para desligar:
 gnome-extensions disable constancia@hendesson.github.io
 ```
 
-Funciona no GNOME 46 a 48. Em outros ambientes o painel é uma janela comum.
+Feita para o GNOME 46 a 50 (testada no 48). Em outros ambientes o painel é uma
+janela comum.
 
 ## Instalação
 
-Precisa de Linux com Python 3.8+ e GTK 4.10+ para Python (já vêm no GNOME; em
-Debian/Ubuntu: `sudo apt install python3-gi gir1.2-gtk-4.0`). O registro
-automático dos dias de uso usa o systemd; a sincronização usa o `git`.
+Funciona em qualquer distro Linux com **Python 3.8+** e **GTK 4.6+** (Ubuntu
+22.04 em diante, Debian 12 em diante, Fedora, Arch, openSUSE, Mint…). O
+registro automático dos dias de uso usa o systemd; a sincronização usa o `git`.
+
+### 1. Dependências
+
+| Distro                         | Comando                                                                          |
+|--------------------------------|----------------------------------------------------------------------------------|
+| Debian, Ubuntu, Mint, Pop!_OS  | `sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0`                    |
+| Fedora                         | `sudo dnf install python3-gobject gtk4`                                          |
+| Arch, Manjaro, EndeavourOS     | `sudo pacman -S python-gobject python-cairo gtk4`                                |
+| openSUSE                       | `sudo zypper install python3-gobject python3-gobject-cairo typelib-1_0-Gtk-4_0` |
+
+No GNOME quase tudo isso já vem instalado. Se faltar algo, o instalador avisa e
+mostra o comando da sua distro.
+
+### 2. Instalar para o seu usuário (qualquer distro, sem `sudo`)
 
 ```sh
 git clone https://github.com/Hendesson/constancia.git
@@ -119,11 +134,48 @@ cd constancia
 ./install.sh
 ```
 
-Não precisa de `sudo`. O instalador coloca o programa em `~/.local/bin`, ativa
-o timer, cria o atalho "Constância" no menu de aplicativos e configura o painel
-para abrir ao entrar na sessão (apague
-`~/.config/autostart/io.github.hendesson.constancia.desktop` se não quiser o
-início automático).
+O instalador coloca o programa em `~/.local/bin`, ativa o timer, cria o atalho
+"Constância" no menu de aplicativos e configura o painel para abrir ao entrar
+na sessão (apague `~/.config/autostart/io.github.hendesson.constancia.desktop`
+se não quiser o início automático). No GNOME, instala também a extensão.
+
+### Alternativa: pacotes
+
+- **Debian/Ubuntu e derivadas** — gere e instale o `.deb`:
+
+  ```sh
+  ./packaging/deb.sh
+  sudo apt install ./dist/constancia_*_all.deb
+  ```
+
+- **Arch e derivadas** — copie `packaging/arch/PKGBUILD` para uma pasta vazia
+  e rode `makepkg -si`.
+
+- **Qualquer distro, para todos os usuários** — `sudo make install` (instala
+  em `/usr/local`; `sudo make uninstall` remove).
+
+Instalado por pacote ou pelo `make`, o painel já abre sozinho ao entrar na
+sessão. Cada usuário pode ainda ligar o registro dos dias de uso com o painel
+fechado e, no GNOME, a extensão:
+
+```sh
+systemctl --user enable --now constancia.timer
+gnome-extensions enable constancia@hendesson.github.io   # depois de sair e entrar na sessão
+```
+
+### O que muda de um ambiente para outro
+
+- **GNOME 46 a 50**: com a extensão, o painel fica preso à área de trabalho.
+- **KDE, Cinnamon, XFCE e outros**: o painel é uma janela comum, sem moldura,
+  que você arrasta para onde quiser.
+- **Distros sem systemd**: os dias de uso são registrados enquanto o painel
+  está aberto (ele abre sozinho na sessão, então na prática dá no mesmo).
+- **GTK 4.6 a 4.9**: tudo funciona; só o seletor de cores e o diálogo de
+  confirmação têm a aparência antiga do GTK.
+
+Testado de verdade apenas no Debian 13 com GNOME 48. Nas outras distros e
+ambientes o suporte segue o que está descrito acima, mas ainda não foi
+conferido em uma máquina real — relatos são bem-vindos.
 
 ## Clima
 

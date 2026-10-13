@@ -17,7 +17,29 @@ else
   echo "  registrados enquanto o painel estiver aberto"
 fi
 
-if python3 -c 'import gi; gi.require_version("Gtk", "4.0")' >/dev/null 2>&1; then
+# O painel precisa de Python com GTK 4.6+ e da ponte com o cairo (para desenhar o gráfico)
+tem_gtk() {
+  python3 -c '
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_foreign("cairo")
+from gi.repository import Gtk
+assert (Gtk.get_major_version(), Gtk.get_minor_version()) >= (4, 6)
+' >/dev/null 2>&1
+}
+
+como_instalar_gtk() {
+  [ -r /etc/os-release ] && . /etc/os-release
+  case " $ID $ID_LIKE " in
+    *" debian "*|*" ubuntu "*) echo "sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0" ;;
+    *" fedora "*|*" rhel "*)   echo "sudo dnf install python3-gobject gtk4" ;;
+    *" arch "*)                echo "sudo pacman -S python-gobject python-cairo gtk4" ;;
+    *" suse "*|*" opensuse "*) echo "sudo zypper install python3-gobject python3-gobject-cairo typelib-1_0-Gtk-4_0" ;;
+    *) echo "instale o PyGObject (com cairo) e o GTK 4 pelo gerenciador de pacotes da sua distro" ;;
+  esac
+}
+
+if tem_gtk; then
   # O arquivo leva o id do aplicativo para o sistema associar janela, ícone e notificações
   ATALHO=io.github.hendesson.constancia.desktop
   mkdir -p "$HOME/.local/share/applications" "$HOME/.config/autostart"
@@ -34,8 +56,9 @@ FIM
   cp "$HOME/.local/share/applications/$ATALHO" "$HOME/.config/autostart/$ATALHO"
   echo "✔ painel no menu de aplicativos e abrindo sozinho ao entrar na sessão"
 else
-  echo "! GTK 4 para Python não encontrado: o painel não vai abrir"
-  echo "  (Debian/Ubuntu: sudo apt install python3-gi gir1.2-gtk-4.0)"
+  echo "! GTK 4.6+ para Python não encontrado: o painel não vai abrir. Instale com:"
+  echo "    $(como_instalar_gtk)"
+  echo "  e rode ./install.sh de novo."
 fi
 
 # Extensão opcional do GNOME: prende o painel à área de trabalho

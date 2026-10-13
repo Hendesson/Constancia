@@ -14,7 +14,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, timedelta
 
-VERSAO = "0.5.0"
+VERSAO = "0.5.1"
 APP_ID = "io.github.hendesson.constancia"
 
 
@@ -796,6 +796,11 @@ def painel():
     cfg = ler_config()
     estado = {}
 
+    # O painel usa recursos do GTK 4.10/4.12 quando existem e tem alternativas para o GTK 4.6+
+    # (ex.: Ubuntu 22.04, Debian 12). CONSTANCIA_GTK_ANTIGO=1 força as alternativas, para teste.
+    def tem(objeto, nome):
+        return hasattr(objeto, nome) and not os.environ.get("CONSTANCIA_GTK_ANTIGO")
+
     def rotulo(texto="", *classes, **props):
         w = Gtk.Label(label=texto, xalign=0, **props)
         for c in classes:
@@ -1033,7 +1038,10 @@ def painel():
 
         def aplicar_aparencia():
             Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", not fundo_claro(cfg))
-            provedor.load_from_string(gerar_css(cfg))
+            if tem(provedor, "load_from_string"):
+                provedor.load_from_string(gerar_css(cfg))
+            else:
+                provedor.load_from_data(gerar_css(cfg).encode())
             for w in (icone, temp, textos):
                 w.set_visible(cfg["mostrar_clima"])
             area.queue_draw()
@@ -1107,7 +1115,10 @@ def painel():
             def seletor_cor(chave):
                 rgba = Gdk.RGBA()
                 rgba.parse(cfg[chave])
-                b = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), rgba=rgba)
+                if tem(Gtk, "ColorDialogButton"):
+                    b = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False), rgba=rgba)
+                else:
+                    b = Gtk.ColorButton(rgba=rgba, use_alpha=False)
                 b.connect("notify::rgba", lambda *_: mudar(chave, "#%02x%02x%02x" % tuple(
                     round(c * 255) for c in (b.get_rgba().red, b.get_rgba().green, b.get_rgba().blue))))
                 controles[chave] = b
@@ -1303,7 +1314,8 @@ def painel():
             barras = Gtk.DrawingArea(content_height=130, hexpand=True)
 
             def desenhar(_a, cr, largura, altura):
-                cor_texto = barras.get_color()
+                cor_texto = barras.get_color() if tem(barras, "get_color") else \
+                    barras.get_style_context().get_color()
                 desenhar_barras(cr, largura, altura, dados["a"].por_semana(12), rgb(cfg["grafico"]),
                                 (cor_texto.red, cor_texto.green, cor_texto.blue))
 
@@ -1343,25 +1355,41 @@ def painel():
                 aviso.set_label(f"Imagem salva em {compartilhar_imagem(True)} e copiada: "
                                 "é só colar onde quiser compartilhar.")
 
+            def confirmar_exclusao():
+                excluir_historico()
+                dados["a"] = Atividade()
+                preencher()
+                recarregar()
+                aviso.set_label("Histórico excluído.")
+
             def ao_responder(dialogo, resultado):
                 try:
                     escolha = dialogo.choose_finish(resultado)
                 except GLib.Error:
                     return
                 if escolha == 1:
-                    excluir_historico()
-                    dados["a"] = Atividade()
-                    preencher()
-                    recarregar()
-                    aviso.set_label("Histórico excluído.")
+                    confirmar_exclusao()
+
+            def ao_responder_antigo(dialogo, escolha):
+                dialogo.destroy()
+                if escolha == 1:
+                    confirmar_exclusao()
 
             def excluir(*_):
-                dialogo = Gtk.AlertDialog(
-                    message="Excluir todo o histórico?",
-                    detail="Os dias de uso e as tarefas concluídas serão apagados, neste computador e nos "
-                           "sincronizados. As tarefas pendentes e o desenho ficam. Isso não pode ser desfeito.",
-                    buttons=["Cancelar", "Excluir"], cancel_button=0, default_button=0)
-                dialogo.choose(w, None, ao_responder)
+                pergunta = "Excluir todo o histórico?"
+                detalhe = ("Os dias de uso e as tarefas concluídas serão apagados, neste computador e nos "
+                           "sincronizados. As tarefas pendentes e o desenho ficam. Isso não pode ser desfeito.")
+                if tem(Gtk, "AlertDialog"):
+                    dialogo = Gtk.AlertDialog(message=pergunta, detail=detalhe, buttons=["Cancelar", "Excluir"],
+                                              cancel_button=0, default_button=0)
+                    dialogo.choose(w, None, ao_responder)
+                else:
+                    dialogo = Gtk.MessageDialog(transient_for=w, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                                text=pergunta, secondary_text=detalhe)
+                    dialogo.add_button("Cancelar", 0)
+                    dialogo.add_button("Excluir", 1)
+                    dialogo.connect("response", ao_responder_antigo)
+                    dialogo.present()
 
             rodape = Gtk.Box(spacing=12)
             b_compartilhar = Gtk.Button(label="Compartilhar imagem")

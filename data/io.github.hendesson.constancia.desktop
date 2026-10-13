@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Constância
+Comment=Clima, tarefas e gráfico de atividade
+Exec=constancia painel
+Icon=x-office-calendar
+Categories=Utility;

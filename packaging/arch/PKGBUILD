@@ -1,0 +1,30 @@
+# Pacote para Arch Linux e derivadas (Manjaro, EndeavourOS...).
+# Uso: copie este arquivo para uma pasta vazia e rode `makepkg -si`.
+pkgname=constancia-git
+pkgver=0
+pkgrel=1
+pkgdesc="Painel com clima, tarefas e gráfico de atividade no estilo contribution graph"
+arch=('any')
+url="https://github.com/Hendesson/constancia"
+license=('MIT')
+depends=('python' 'python-gobject' 'python-cairo' 'gtk4')
+optdepends=('git: sincronização entre computadores'
+            'sound-theme-freedesktop: som dos alarmes'
+            'gnome-shell: extensão que prende o painel à área de trabalho')
+makedepends=('git')
+provides=('constancia')
+conflicts=('constancia')
+source=("$pkgname::git+https://github.com/Hendesson/constancia.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf "%s.r%s.%s" "$(./constancia --version | cut -d' ' -f2)" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+  cd "$pkgname"
+  make install PREFIX=/usr DESTDIR="$pkgdir"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -2,6 +2,12 @@
   "uuid": "constancia@hendesson.github.io",
   "name": "Constância — painel fixo",
   "description": "Prende o painel do Constância à área de trabalho: fica atrás das outras janelas, aparece em todas as áreas de trabalho e lembra a posição.",
-  "shell-version": ["46", "47", "48"],
+  "shell-version": [
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
   "url": "https://github.com/Hendesson/constancia"
 }
