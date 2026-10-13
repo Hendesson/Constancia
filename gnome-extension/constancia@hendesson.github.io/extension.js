@@ -1,12 +1,56 @@
-// Prende a janela do painel do Constância à área de trabalho:
-// atrás das outras janelas, em todas as áreas de trabalho e na posição salva.
+// Prende a janela do painel do Constância à área de trabalho (atrás das outras
+// janelas, em todas as áreas de trabalho e na posição salva) e põe dois atalhos
+// para abri-lo: um ícone na barra superior, ao lado dos ícones do sistema, e um
+// botão no menu rápido (o do volume, rede e energia).
+import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
+import Shell from 'gi://Shell';
+import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 const APP_ID = 'io.github.hendesson.constancia';
 const TITULO = 'Constância';
 const MARGEM = 24;
+
+// Abre o painel (ou o traz para a frente, se já estiver aberto)
+function abrirPainel() {
+    Shell.AppSystem.get_default().lookup_app(`${APP_ID}.desktop`)?.activate();
+}
+
+// Botão "Constância" no menu rápido
+const Atalho = GObject.registerClass(
+class Atalho extends QuickSettings.QuickToggle {
+    _init(icone) {
+        super._init({
+            title: TITULO,
+            subtitle: 'Abrir o painel',
+            gicon: icone,
+            toggleMode: false,
+        });
+        this.connect('clicked', () => {
+            Main.panel.closeQuickSettings();
+            abrirPainel();
+        });
+    }
+});
+
+const Indicador = GObject.registerClass(
+class Indicador extends QuickSettings.SystemIndicator {
+    _init(icone) {
+        super._init();
+        this.quickSettingsItems.push(new Atalho(icone));
+    }
+
+    destroy() {
+        this.quickSettingsItems.forEach(item => item.destroy());
+        super.destroy();
+    }
+});
 
 export default class ConstanciaExtension extends Extension {
     enable() {
@@ -16,12 +60,42 @@ export default class ConstanciaExtension extends Extension {
         this._timers = new Set();
         this._salvarId = 0;
         this._criada = global.display.connect('window-created', (_d, janela) => this._observar(janela));
+        // O painel fica no fundo, mas vem para a frente enquanto está em uso (ao ser aberto
+        // pelo ícone ou clicado) e volta para o fundo quando o foco vai para outra janela.
+        this._foco = global.display.connect('notify::focus-window', () => {
+            for (const janela of this._fixadas.keys()) {
+                if (global.display.focus_window !== janela)
+                    janela.lower();
+            }
+        });
+        const icone = Gio.icon_new_for_string(`${this.path}/constancia-symbolic.svg`);
+        this._indicador = new Indicador(icone);
+        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicador);
+
+        // Ícone na barra superior, logo à esquerda dos ícones do sistema: um clique abre o painel
+        this._botao = new PanelMenu.Button(0.0, TITULO, true);
+        this._botao.add_child(new St.Icon({gicon: icone, style_class: 'system-status-icon'}));
+        this._botao.connect('button-press-event', () => {
+            abrirPainel();
+            return Clutter.EVENT_STOP;
+        });
+        this._botao.connect('touch-event', (_ator, evento) => {
+            if (evento.type() === Clutter.EventType.TOUCH_END)
+                abrirPainel();
+            return Clutter.EVENT_PROPAGATE;
+        });
+        const ultimo = Math.max(0, Main.panel._rightBox.get_n_children() - 1);
+        Main.panel.addToStatusArea(this.uuid, this._botao, ultimo, 'right');
         for (const ator of global.get_window_actors())
             this._fixarSeForPainel(ator.meta_window);
     }
 
     disable() {
         global.display.disconnect(this._criada);
+        global.display.disconnect(this._foco);
+        this._indicador.destroy();
+        this._botao.destroy();
+        this._indicador = this._botao = null;
         for (const [janela, id] of this._esperando)
             janela.disconnect(id);
         for (const janela of [...this._fixadas.keys()])
@@ -51,7 +125,6 @@ export default class ConstanciaExtension extends Extension {
         janela.stick();
         janela.lower();
         this._fixadas.set(janela, [
-            janela.connect('raised', () => janela.lower()),
             janela.connect('position-changed', () => this._agendarSalvar(janela)),
             janela.connect('unmanaged', () => this._soltar(janela, false)),
         ]);

@@ -3,5 +3,5 @@ Type=Application
 Name=Constância
 Comment=Clima, tarefas e gráfico de atividade
 Exec=constancia painel
-Icon=x-office-calendar
+Icon=io.github.hendesson.constancia
 Categories=Utility;

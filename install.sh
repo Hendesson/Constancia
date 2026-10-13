@@ -50,10 +50,12 @@ Type=Application
 Name=Constância
 Comment=Clima, tarefas e gráfico de atividade
 Exec=$HOME/.local/bin/constancia painel
-Icon=x-office-calendar
+Icon=io.github.hendesson.constancia
 Categories=Utility;
 FIM
   cp "$HOME/.local/share/applications/$ATALHO" "$HOME/.config/autostart/$ATALHO"
+  install -Dm644 data/io.github.hendesson.constancia.svg \
+    "$HOME/.local/share/icons/hicolor/scalable/apps/io.github.hendesson.constancia.svg"
   echo "✔ painel no menu de aplicativos e abrindo sozinho ao entrar na sessão"
 else
   echo "! GTK 4.6+ para Python não encontrado: o painel não vai abrir. Instale com:"

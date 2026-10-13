@@ -8,5 +8,6 @@ for pasta in "$HOME/.local/share/applications" "$HOME/.config/autostart"; do
 done
 gnome-extensions disable constancia@hendesson.github.io >/dev/null 2>&1
 rm -rf "$HOME/.local/share/gnome-shell/extensions/constancia@hendesson.github.io"
+rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/io.github.hendesson.constancia.svg"
 rm -f "$HOME/.local/bin/constancia"
 echo "✔ removido (dados mantidos em ~/.local/share/constancia)"

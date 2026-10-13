@@ -16,6 +16,7 @@ UNITDIR = $(DESTDIR)$(PREFIX)/lib/systemd/user
 APPDIR = $(DESTDIR)$(PREFIX)/share/applications
 AUTOSTARTDIR = $(DESTDIR)$(SYSCONFDIR)/xdg/autostart
 EXTDIR = $(DESTDIR)$(PREFIX)/share/gnome-shell/extensions/$(EXT)
+ICONDIR = $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps
 DOCDIR = $(DESTDIR)$(PREFIX)/share/doc/constancia
 
 .PHONY: install uninstall
@@ -27,12 +28,14 @@ install:
 	chmod 644 $(UNITDIR)/constancia.service
 	install -Dm644 data/$(APP).desktop $(APPDIR)/$(APP).desktop
 	install -Dm644 data/$(APP).desktop $(AUTOSTARTDIR)/$(APP).desktop
+	install -Dm644 data/$(APP).svg $(ICONDIR)/$(APP).svg
 	install -Dm644 gnome-extension/$(EXT)/metadata.json $(EXTDIR)/metadata.json
 	install -Dm644 gnome-extension/$(EXT)/extension.js $(EXTDIR)/extension.js
+	install -Dm644 gnome-extension/$(EXT)/constancia-symbolic.svg $(EXTDIR)/constancia-symbolic.svg
 	install -Dm644 README.md $(DOCDIR)/README.md
 	install -Dm644 LICENSE $(DOCDIR)/LICENSE
 
 uninstall:
 	rm -f $(BINDIR)/constancia $(UNITDIR)/constancia.timer $(UNITDIR)/constancia.service
-	rm -f $(APPDIR)/$(APP).desktop $(AUTOSTARTDIR)/$(APP).desktop
+	rm -f $(APPDIR)/$(APP).desktop $(AUTOSTARTDIR)/$(APP).desktop $(ICONDIR)/$(APP).svg
 	rm -rf $(EXTDIR) $(DOCDIR)

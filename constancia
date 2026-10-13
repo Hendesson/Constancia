@@ -14,7 +14,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, timedelta
 
-VERSAO = "0.5.1"
+VERSAO = "0.6.0"
 APP_ID = "io.github.hendesson.constancia"
 
 
@@ -818,8 +818,9 @@ def painel():
             caixa.remove(caixa.get_first_child())
 
     def ao_ativar(app):
-        if app.get_active_window():
-            app.get_active_window().present()
+        if estado.get("janela"):  # já está rodando (talvez em segundo plano): só mostra o painel
+            estado["janela"].set_visible(True)
+            estado["janela"].present()
             return
         provedor = Gtk.CssProvider()
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
@@ -846,7 +847,8 @@ def painel():
         botoes.append(botao("document-open-recent-symbolic", "Histórico, resumo e progresso",
                             lambda: abrir_historico()))
         botoes.append(botao("emblem-system-symbolic", "Configurações", lambda: abrir_configuracoes()))
-        botoes.append(botao("window-close-symbolic", "Fechar", janela.close))
+        botoes.append(botao("window-minimize-symbolic", "Minimizar", janela.minimize))
+        botoes.append(botao("window-close-symbolic", "Fechar (continua em segundo plano)", janela.close))
         for w in (icone, temp, textos, Gtk.Box(hexpand=True), botoes):
             topo.append(w)
         caixa.append(topo)
@@ -1222,6 +1224,9 @@ def painel():
             padrao = Gtk.Button(label="Restaurar aparência padrão")
             padrao.connect("clicked", restaurar)
             linha("As mudanças valem na hora.", padrao)
+            sair = Gtk.Button(label="Encerrar o Constância")
+            sair.connect("clicked", lambda *_: app.quit())
+            linha("Fechar o painel só o esconde.", sair)
             w.present()
 
         # --- editor do desenho ---
@@ -1437,8 +1442,20 @@ def painel():
         sincronizar_em_segundo_plano()
         GLib.timeout_add_seconds(600, periodico)
         GLib.timeout_add_seconds(20, verificar_alarmes)
-        # Fechar o painel encerra o programa, mesmo com outras janelas dele abertas
-        janela.connect("close-request", lambda *_: app.quit())
+        # Fechar só esconde o painel: o programa segue em segundo plano (alarmes, lembrete,
+        # sincronização) e abrir o Constância de novo pelo ícone mostra o painel outra vez.
+        def ao_fechar_painel(*_):
+            janela.set_visible(False)
+            if not ler_json(ESTADO).get("avisou_segundo_plano"):
+                gravar_json(ESTADO, dict(ler_json(ESTADO), avisou_segundo_plano=True))
+                notificar("O Constância continua em segundo plano",
+                          "Abra de novo pelo ícone do aplicativo. Para encerrar de vez, use as configurações.",
+                          "segundo-plano")
+            return True
+
+        janela.connect("close-request", ao_fechar_painel)
+        estado["janela"] = janela
+        app.hold()
         janela.present()
 
     app = Gtk.Application(application_id=APP_ID)

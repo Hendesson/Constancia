@@ -1,7 +1,7 @@
 {
   "uuid": "constancia@hendesson.github.io",
-  "name": "Constância — painel fixo",
-  "description": "Prende o painel do Constância à área de trabalho: fica atrás das outras janelas, aparece em todas as áreas de trabalho e lembra a posição.",
+  "name": "Constância — painel fixo e atalho",
+  "description": "Prende o painel do Constância à área de trabalho (atrás das outras janelas, em todas as áreas de trabalho, lembrando a posição) e põe atalhos para abri-lo: um ícone na barra superior e um botão no menu rápido do sistema.",
   "shell-version": [
     "46",
     "47",

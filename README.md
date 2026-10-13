@@ -14,6 +14,12 @@ concluída conta mais**.
 - O ícone de despertador ao lado da tarefa põe um **alarme** nela.
 - Passe o mouse sobre um quadradinho para ver o que aconteceu naquele dia.
 - Arraste o painel por qualquer ponto para movê-lo.
+- Os botões no canto minimizam ou fecham o painel. **Fechar só o esconde**: o
+  programa continua em segundo plano (alarmes e lembretes seguem valendo) e
+  basta clicar no ícone do Constância para o painel voltar. Para ter o ícone
+  sempre à mão, fixe-o no dock ou na barra de tarefas (no GNOME: clique direito
+  no ícone → "Fixar no dash"). Para encerrar de
+  vez, use *Configurações → Encerrar o Constância*.
 - O relógio no canto abre o **histórico**; a engrenagem abre as
   **configurações**.
 
@@ -94,12 +100,20 @@ alarmes e desenho são unidos sem conflito; cores e demais configurações ficam
 por computador. Use um repositório privado: as suas tarefas ficam nele em texto
 simples.
 
-## Painel preso à área de trabalho (GNOME)
+## Extensão do GNOME: painel preso e atalhos na barra superior
 
-No GNOME, o instalador também instala uma pequena extensão que deixa o painel
-atrás das outras janelas, visível em todas as áreas de trabalho, e lembra onde
-você o colocou (na primeira vez ele vai para o canto superior direito). Ela
-passa a valer depois de sair da sessão e entrar de novo. Para desligar:
+No GNOME, o instalador também instala uma pequena extensão que:
+
+- deixa o painel **preso à área de trabalho**: atrás das outras janelas,
+  visível em todas as áreas de trabalho e lembrando onde você o colocou (na
+  primeira vez ele vai para o canto superior direito). Enquanto você usa o
+  painel ele vem para a frente, e volta para o fundo ao trocar de janela;
+- põe um **ícone na barra superior**, ao lado dos ícones de volume, rede e
+  energia: um clique abre o painel;
+- põe um botão **Constância** no **menu rápido** do sistema (o que abre ao
+  clicar nesses ícones), que também abre o painel.
+
+Ela passa a valer depois de sair da sessão e entrar de novo. Para desligar:
 
 ```sh
 gnome-extensions disable constancia@hendesson.github.io
